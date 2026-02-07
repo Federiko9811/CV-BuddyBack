@@ -1,0 +1,55 @@
+name: Code Check
+
+on:
+  pull_request:
+    branches: [ "main", "devel" ]
+  push:
+    branches: [ "main", "devel" ]
+
+env:
+  CACHE_NAME: buddyback-frontend
+
+jobs:
+  code-check:
+    env:
+      RUNNER_TOOL_CACHE: /toolcache
+    name: code-check
+    runs-on: docker
+    container:
+      image: catthehacker/ubuntu:act-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: https://github.com/actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            **/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: |
+          npm install
+
+      - name: Run linting
+        run: npm run lint
+
+      # Only trigger the build workflow if this is a push to main branch and all checks pass
+      - name: Trigger build workflow
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && success() }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" \
+            -d '{"ref":"main"}'
