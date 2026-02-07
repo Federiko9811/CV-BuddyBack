@@ -3,14 +3,15 @@ Main posture detection module that integrates camera capture and posture analysi
 """
 
 import asyncio
+import concurrent.futures
 import multiprocessing
 import os
 import signal
 import time
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import cv2
-import mediapipe as mp
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
@@ -30,12 +31,20 @@ from utils.visualization import (
     get_optimal_font_scale,
 )
 
+if TYPE_CHECKING:
+    from detector.pose_estimators import PoseEstimator
+
 
 class PostureDetector(QObject):
     """Main class for posture detection"""
 
     def __init__(
-        self, camera_manager, show_guidance=True, model_complexity=2, websocket_client=None, app_controller=None
+        self, 
+        camera_manager, 
+        show_guidance=True, 
+        pose_estimator: "PoseEstimator" = None,
+        websocket_client=None, 
+        app_controller=None
     ):
         """
         Initialize posture detector
@@ -43,7 +52,7 @@ class PostureDetector(QObject):
         Args:
             camera_manager: CameraManager instance for handling video capture
             show_guidance: Whether to show posture correction guidance
-            model_complexity: Complexity of the MediaPipe pose model (0, 1, or 2)
+            pose_estimator: PoseEstimator instance for pose detection
             websocket_client: WebSocket client for sending/receiving data
             app_controller: Controller for the PyQt application
         """
@@ -56,11 +65,10 @@ class PostureDetector(QObject):
         self.good_frames = 0
         self.bad_frames = 0
 
-        # Initialize MediaPipe pose detection
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            model_complexity=model_complexity, min_detection_confidence=0.7, min_tracking_confidence=0.7
-        )
+        # Store the pose estimator (should already be initialized)
+        if pose_estimator is None:
+            raise ValueError("pose_estimator is required")
+        self.pose_estimator = pose_estimator
 
         # Initialize posture analyzer
         self.analyzer = PostureAnalyzer()
@@ -89,6 +97,27 @@ class PostureDetector(QObject):
 
         if os.getenv("DISABLE_VIBRATION", False).lower() not in ["true", "1", "yes"]:
             self.gpio_client = PigpioClient()
+
+        # Thread pool for running blocking operations (like TensorFlow inference)
+        # This prevents blocking the asyncio event loop on slower devices like Raspberry Pi
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
+        # Landmark smoothing with moving average
+        # Stores recent landmark positions for averaging
+        self._landmark_history = []
+        self._smoothing_window = 10  # Number of frames to average
+        
+        # Calibration timing
+        self._calibration_start_time = None
+        self._calibration_duration = 3.0  # seconds
+        
+        # Webcam side mode: "auto", "left", or "right"
+        self._webcam_side_mode = "auto"
+        
+        # Connect UI signals
+        if self.app_controller:
+            self.app_controller.posture_window.calibration_clicked.connect(self.start_calibration)
+            self.app_controller.posture_window.side_mode_changed.connect(self.set_webcam_side_mode)
 
     def _update_history(self, analysis_results):
         if analysis_results["webcam_placement"] != "good":
@@ -187,99 +216,200 @@ class PostureDetector(QObject):
 
         # All window resize functionality has been removed since we're not using OpenCV windows
         return True
-
-    def extract_landmarks(self, pose_landmarks, frame_width, frame_height):
+    
+    def start_calibration(self):
+        """Start the calibration process."""
+        self.analyzer.start_calibration()
+        self._calibration_start_time = time.time()
+        if self.app_controller:
+            self.app_controller.posture_window.show_alert(
+                "Sit in your best posture...", duration=3000
+            )
+    
+    def set_webcam_side_mode(self, mode: str):
+        """Set the webcam side mode.
+        
+        Args:
+            mode: "auto", "left", or "right"
         """
-        Extract key landmarks from MediaPipe pose results
+        self._webcam_side_mode = mode
+        print(f"[PostureDetector] Webcam side mode set to: {mode}")
+    
+    def check_calibration_complete(self):
+        """Check if calibration should be completed (after duration elapsed)."""
+        if self.analyzer.is_calibrating and self._calibration_start_time is not None:
+            elapsed = time.time() - self._calibration_start_time
+            if elapsed >= self._calibration_duration:
+                self.analyzer.complete_calibration()
+                self._calibration_start_time = None
+                if self.app_controller:
+                    baseline = self.analyzer.baseline_torso_angle
+                    self.app_controller.posture_window.show_alert(
+                        f"Calibrated! Baseline: {baseline:.1f}°", duration=2000
+                    )
+    
+    async def _process_stdin_commands(self):
+        """Process user commands from stdin asynchronously."""
+        import sys
+        loop = asyncio.get_event_loop()
+        
+        while True:
+            try:
+                # Read line from stdin in a non-blocking way
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+                command = line.strip().lower()
+                
+                if not command:
+                    continue
+                
+                if command in ("c", "calibrate"):
+                    self.start_calibration()
+                elif command in ("r", "reset"):
+                    self.analyzer.reset_calibration()
+                    if self.app_controller:
+                        self.app_controller.posture_window.show_alert(
+                            "Calibration reset", duration=2000
+                        )
+                elif command == "data":
+                    # Send current posture data
+                    if hasattr(self, "_last_analysis_results") and self._last_analysis_results:
+                        await self.websocket_client.send_posture_data(self._last_analysis_results)
+                else:
+                    print(f"Unknown command: {command}")
+            except Exception as e:
+                print(f"Error processing command: {e}")
+                await asyncio.sleep(1)
+
+    def extract_landmarks_from_result(self, pose_result):
+        """
+        Convert PoseResult landmarks to the legacy format expected by PostureAnalyzer.
 
         Args:
-            pose_landmarks: MediaPipe pose landmarks
-            frame_width: Width of the frame
-            frame_height: Height of the frame
+            pose_result: PoseResult from the pose estimator
 
         Returns:
-            Dictionary: Key landmarks with coordinates
+            Dictionary: Key landmarks with coordinates in legacy format
         """
-        lm = pose_landmarks
-        lmPose = self.mp_pose.PoseLandmark
-
+        if not pose_result.success:
+            return {}
+        
         landmarks = {}
+        result_landmarks = pose_result.landmarks
 
         try:
-            # Left shoulder
-            landmarks["l_shoulder"] = (
-                int(lm.landmark[lmPose.LEFT_SHOULDER].x * frame_width),
-                int(lm.landmark[lmPose.LEFT_SHOULDER].y * frame_height),
-            )
+            # Required landmarks for posture analysis
+            required_landmarks = ["l_shoulder", "r_shoulder", "l_ear", "r_ear", "l_hip", "r_hip"]
+            
+            for name in required_landmarks:
+                if name in result_landmarks:
+                    lm = result_landmarks[name]
+                    landmarks[name] = (lm.x, lm.y)
+                else:
+                    # Landmark not available from this estimator
+                    return {}
+            
+            # Calculate visibility scores
+            l_ear_vis = result_landmarks.get("l_ear", None)
+            r_ear_vis = result_landmarks.get("r_ear", None)
+            l_ear_visibility = l_ear_vis.visibility if l_ear_vis else 0
+            r_ear_visibility = r_ear_vis.visibility if r_ear_vis else 0
+            
+            l_hip_vis = result_landmarks.get("l_hip", None)
+            r_hip_vis = result_landmarks.get("r_hip", None)
+            l_hip_visibility = l_hip_vis.visibility if l_hip_vis else 0
+            r_hip_visibility = r_hip_vis.visibility if r_hip_vis else 0
+            
+            l_shoulder_vis = result_landmarks.get("l_shoulder", None)
+            r_shoulder_vis = result_landmarks.get("r_shoulder", None)
+            l_shoulder_visibility = l_shoulder_vis.visibility if l_shoulder_vis else 0
+            r_shoulder_visibility = r_shoulder_vis.visibility if r_shoulder_vis else 0
 
-            # Right shoulder
-            landmarks["r_shoulder"] = (
-                int(lm.landmark[lmPose.RIGHT_SHOULDER].x * frame_width),
-                int(lm.landmark[lmPose.RIGHT_SHOULDER].y * frame_height),
-            )
-
-            # Both ears for better detection regardless of webcam position
-            landmarks["l_ear"] = (
-                int(lm.landmark[lmPose.LEFT_EAR].x * frame_width),
-                int(lm.landmark[lmPose.LEFT_EAR].y * frame_height),
-            )
-
-            landmarks["r_ear"] = (
-                int(lm.landmark[lmPose.RIGHT_EAR].x * frame_width),
-                int(lm.landmark[lmPose.RIGHT_EAR].y * frame_height),
-            )
-
-            # Left hip
-            landmarks["l_hip"] = (
-                int(lm.landmark[lmPose.LEFT_HIP].x * frame_width),
-                int(lm.landmark[lmPose.LEFT_HIP].y * frame_height),
-            )
-
-            # Right hip
-            landmarks["r_hip"] = (
-                int(lm.landmark[lmPose.RIGHT_HIP].x * frame_width),
-                int(lm.landmark[lmPose.RIGHT_HIP].y * frame_height),
-            )
-
-            # Calculate visibility scores for ear landmarks
-            # Higher score = more visible/reliable
-            l_ear_vis = (
-                lm.landmark[lmPose.LEFT_EAR].visibility if hasattr(lm.landmark[lmPose.LEFT_EAR], "visibility") else 0
-            )
-            r_ear_vis = (
-                lm.landmark[lmPose.RIGHT_EAR].visibility if hasattr(lm.landmark[lmPose.RIGHT_EAR], "visibility") else 0
-            )
-            l_hip_vis = (
-                lm.landmark[lmPose.LEFT_HIP].visibility if hasattr(lm.landmark[lmPose.LEFT_HIP], "visibility") else 0
-            )
-            r_hip_vis = (
-                lm.landmark[lmPose.RIGHT_HIP].visibility if hasattr(lm.landmark[lmPose.RIGHT_HIP], "visibility") else 0
-            )
-            l_shoulder_vis = (
-                lm.landmark[lmPose.LEFT_SHOULDER].visibility
-                if hasattr(lm.landmark[lmPose.LEFT_SHOULDER], "visibility")
-                else 0
-            )
-            r_shoulder_vis = (
-                lm.landmark[lmPose.RIGHT_SHOULDER].visibility
-                if hasattr(lm.landmark[lmPose.RIGHT_SHOULDER], "visibility")
-                else 0
-            )
-
-            # Add information about which ear is more visible (useful for analyzing posture)
-            landmarks["primary_ear"] = "left" if l_ear_vis >= r_ear_vis else "right"
-            landmarks["l_ear_visibility"] = l_ear_vis
-            landmarks["r_ear_visibility"] = r_ear_vis
-            landmarks["l_hip_visibility"] = l_hip_vis
-            landmarks["r_hip_visibility"] = r_hip_vis
-            landmarks["l_shoulder_visibility"] = l_shoulder_vis
-            landmarks["r_shoulder_visibility"] = r_shoulder_vis
+            # Determine which ear/side is "primary" (facing the camera)
+            # Check if user has manually selected a side mode
+            if self._webcam_side_mode in ("left", "right"):
+                # User has forced a specific side
+                primary_ear = self._webcam_side_mode
+            elif self.pose_estimator.uses_reliable_visibility:
+                # For models with reliable visibility (OpenPose, MoveNet): use ear visibility
+                primary_ear = "left" if l_ear_visibility >= r_ear_visibility else "right"
+            else:
+                # MediaPipe: visibility is always ~1.0, so use shoulder X positions instead
+                # The shoulder closer to camera (lower X in image) determines which side faces camera
+                l_shoulder_x = l_shoulder_vis.x if l_shoulder_vis else 0
+                r_shoulder_x = r_shoulder_vis.x if r_shoulder_vis else 0
+                # Note: l_shoulder_x > r_shoulder_x means user faces right, so right ear is primary
+                primary_ear = "right" if l_shoulder_x > r_shoulder_x else "left"
+            
+            landmarks["primary_ear"] = primary_ear
+            landmarks["l_ear_visibility"] = l_ear_visibility
+            landmarks["r_ear_visibility"] = r_ear_visibility
+            landmarks["l_hip_visibility"] = l_hip_visibility
+            landmarks["r_hip_visibility"] = r_hip_visibility
+            landmarks["l_shoulder_visibility"] = l_shoulder_visibility
+            landmarks["r_shoulder_visibility"] = r_shoulder_visibility
 
             return landmarks
 
         except Exception as e:
             print(f"Error extracting landmarks: {e}")
             return {}
+    
+    def _smooth_landmarks(self, landmarks: dict) -> dict:
+        """
+        Apply moving average smoothing to landmark positions.
+        
+        This reduces jitter in models with noisy outputs (like MoveNet/PoseNet).
+        Only smooths coordinate tuples, not metadata like visibility values.
+        
+        Args:
+            landmarks: Dictionary of landmark coordinates
+            
+        Returns:
+            Dictionary with smoothed coordinates
+        """
+        if not landmarks:
+            return landmarks
+        
+        # Add current landmarks to history
+        self._landmark_history.append(landmarks.copy())
+        
+        # Keep only recent frames
+        if len(self._landmark_history) > self._smoothing_window:
+            self._landmark_history.pop(0)
+        
+        # Not enough history yet, return original
+        if len(self._landmark_history) < 2:
+            return landmarks
+        
+        # Calculate moving average for each landmark
+        smoothed = {}
+        for key in landmarks:
+            value = landmarks[key]
+            
+            # Only smooth coordinate tuples (x, y)
+            if isinstance(value, tuple) and len(value) == 2:
+                # Collect values from history
+                x_values = []
+                y_values = []
+                for hist_landmarks in self._landmark_history:
+                    if key in hist_landmarks:
+                        hist_value = hist_landmarks[key]
+                        if isinstance(hist_value, tuple) and len(hist_value) == 2:
+                            x_values.append(hist_value[0])
+                            y_values.append(hist_value[1])
+                
+                if x_values and y_values:
+                    # Calculate average
+                    avg_x = int(sum(x_values) / len(x_values))
+                    avg_y = int(sum(y_values) / len(y_values))
+                    smoothed[key] = (avg_x, avg_y)
+                else:
+                    smoothed[key] = value
+            else:
+                # Keep non-coordinate values as-is (visibility, primary_ear, etc.)
+                smoothed[key] = value
+        
+        return smoothed
 
     async def process_frame(self, frame):
         """
@@ -296,25 +426,48 @@ class PostureDetector(QObject):
         font_scale = get_optimal_font_scale(w)
         thickness = max(1, int(w / 640))
 
-        # Convert the BGR image to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Process the image with MediaPipe
-        result = self.pose.process(rgb_frame)
-        if not result.pose_landmarks:
-            webcam_placement_text = f"Person is not visible"
+        # Process the image with the pose estimator
+        # Run in executor to avoid blocking the asyncio event loop
+        # This is critical for slow models (like TensorFlow on Raspberry Pi) to prevent WebSocket timeouts
+        loop = asyncio.get_event_loop()
+        pose_result = await loop.run_in_executor(
+            self._executor, 
+            self.pose_estimator.process, 
+            frame
+        )
+        
+        if not pose_result.success:
+            webcam_placement_text = "Person is not visible"
             self.app_controller.posture_window.show_alert(
                 webcam_placement_text
             )
             return frame
 
-        # Extract landmarks
-        landmarks = self.extract_landmarks(result.pose_landmarks, w, h)
+        # Extract landmarks in legacy format
+        landmarks = self.extract_landmarks_from_result(pose_result)
+        
+        if not landmarks:
+            webcam_placement_text = "Person is not visible"
+            self.app_controller.posture_window.show_alert(
+                webcam_placement_text
+            )
+            return frame
+        
+        # Apply smoothing if the estimator uses it
+        if self.pose_estimator.uses_smoothing:
+            landmarks = self._smooth_landmarks(landmarks)
+            
         draw_landmarks(frame, landmarks)
 
         sensitivity = self.settings.get("sensitivity", -1)
+        # Get visibility thresholds from the pose estimator (model-specific)
+        visibility_thresholds = self.pose_estimator.visibility_thresholds
+        # Check if this estimator has reliable visibility for side detection
+        uses_reliable_visibility = self.pose_estimator.uses_reliable_visibility
         # Analyze posture
-        analysis_results = self.analyzer.analyze_posture(landmarks, sensitivity)
+        analysis_results = self.analyzer.analyze_posture(
+            landmarks, sensitivity, visibility_thresholds, uses_reliable_visibility
+        )
 
         self._update_history(analysis_results)
         self._maybe_send_posture(analysis_results)
@@ -341,9 +494,16 @@ class PostureDetector(QObject):
         self.app_controller.posture_window.update_results(results, colors)
 
         if os.getenv("RASPI_DISPLAY", False).lower() in ["true", "1", "yes"]:
-            user_looking = is_looking_at_camera(result.pose_landmarks.landmark)
-            if user_looking:
-                turn_on_screen()  # wake up the screen if user is looking at it
+            # is_looking_at_camera only works with MediaPipe raw output
+            # Try to extract the landmarks from raw_output if available
+            try:
+                raw = pose_result.raw_output
+                if hasattr(raw, 'pose_landmarks') and raw.pose_landmarks:
+                    user_looking = is_looking_at_camera(raw.pose_landmarks.landmark)
+                    if user_looking:
+                        turn_on_screen()  # wake up the screen if user is looking at it
+            except (AttributeError, TypeError):
+                pass  # Skip for non-MediaPipe estimators
 
         if os.getenv("DISABLE_VIBRATION", False).lower() not in ["true", "1", "yes"]:
             # If the last posture is bad then...
@@ -511,11 +671,16 @@ class PostureDetector(QObject):
             print("=" * 50)
             print("Commands:")
             print("  'data' - Send single posture data sample")
+            print("  'c' or 'calibrate' - Start posture calibration")
+            print("  'r' or 'reset' - Reset calibration to default")
             print("=" * 50)
             print(f"DEBUG: Waiting for messages at {time.strftime('%H:%M:%S')}")
 
             # Start a task to continuously update settings
             asyncio.create_task(self.update_settings())
+            
+            # Start a task to process user commands from stdin
+            asyncio.create_task(self._process_stdin_commands())
 
             # Get initial session state
             initial_session_active = self.settings.get("has_active_session", False)
@@ -582,6 +747,9 @@ class PostureDetector(QObject):
                 if not success:
                     print("Error: Failed to capture image from webcam")
                     break
+
+                # Check if calibration should complete
+                self.check_calibration_complete()
 
                 # Process the frame
                 processed_frame = await self.process_frame(frame)
